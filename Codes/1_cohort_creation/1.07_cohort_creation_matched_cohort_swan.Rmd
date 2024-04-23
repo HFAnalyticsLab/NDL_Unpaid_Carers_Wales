@@ -1,0 +1,234 @@
+---
+title: "Match-Swansea"
+author: "Peje"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Login 
+```{r login, echo = FALSE, include = FALSE}
+source('../../filepaths.R') # read in filepaths
+source(paste0(main_project_path, '1429_RODBC_login_20221031.R'))
+source(paste0(cohort_creation_path, 'functions/1429_matching_functions_peje_20221107.R'))
+source(paste0(cohort_creation_path, 'functions/1429_Exclusion_criteria_filter_PostMatching_peje_20221103.R'))
+```
+
+
+
+# Load libraries
+```{r, load_lib, echo = FALSE, include = FALSE}
+library(dplyr)
+library(lubridate)
+library(openxlsx)
+library(ggplot2)
+library(stats)
+library(tigerstats)
+library(sqldf)
+library(AMR)
+library(cobalt)
+library(hrbrthemes)
+```
+
+#remove unneeded vars
+```{r, echo = FALSE, include = FALSE}
+rm(list=ls()[! ls() %in% c("login","npt_matchingpool_raw","swa_uc_raw","swa_matchingpool_GPRegLkup","swa_matchingpool_LSOALkup","RUC_lkup","WIMD19Quin_lkup", "swa_mp_unpaidcarerevent")])
+```
+
+
+
+# Import data from eclipse
+# - initialise WIMD levels and accompanying description
+# - import tables 
+```{r import_data, echo = FALSE, include = FALSE}
+
+# initialise WIMD levels and accompanying description
+WIMD19Quin_lkup <- data.frame(
+  WIMD = c(1,2,3,4,5),
+  WIMD_DESC = c("1. Most deprived","2","3","4","5. Least deprived"))
+
+RUC_lkup <- sqlQuery(sql, "SELECT DISTINCT RUC11CD, RUC11 AS RUC11_DESC  FROM SAILREFRV.RURAL_URBAN_CLASS_2011_OF_LLSOAREAS_IN_ENG_AND_WAL")
+
+swa_matchingpool_raw <- sqlQuery(sql, "SELECT * FROM SAILW1429V.PEJE_GPMATCHINGPOOL_SWANSEA")
+swa_uc_raw <- sqlQuery(sql, "SELECT * FROM SAILW1429V.PEJE_DEDUP_GP_LA_SWANSEA")
+mp_unpaidcarerevent <- sqlQuery(sql,"SELECT DISTINCT ALF_PE, EVENT_DT FROM SAILW1429V.PEJE_GPMATCHINGPOOL_UNPAIDCARERSCODES_SWANSEA")
+matchingpool_GPRegLkup <- sqlQuery(sql, "SELECT * FROM SAILW1429V.PEJE_GPMATCHINGPOOL_GPREGLKUP_SWANSEA")
+matchingpool_LSOALkup <- sqlQuery(sql, "SELECT * FROM SAILW1429V.PEJE_GPMATCHINGPOOL_LSOALKUP_SWANSEA")
+
+```
+
+
+# Data preparation
+# - subset baseline characteristics required for matching in unpaid carers data
+# -- join WIMD description
+# -- run dataprep function on df
+# - subset baseline characteristics required for matching in matching pool data
+# -- run dataprep function on df
+```{r echo = FALSE, include = FALSE}
+#subset baseline characteristics for Unpaid carers
+UnpaidCarers_df <- swa_uc_raw[, c("ALF_PE", "WOB","DEATH_DT","SEX", "AGE_STUDYSTART", "LSOA2011_CD","WIMD","RUC11CD","RUC11_DESC", "IDENTIFIEDBY")]
+
+# join desc for WIMD
+UnpaidCarers_df <- UnpaidCarers_df %>%  merge(WIMD19Quin_lkup, by.x= "WIMD", by.y="WIMD")
+UnpaidCarers_baseline <- dataprep(UnpaidCarers_df)
+
+#subset baseline characteristics for general population
+MatchingPool_df <- swa_matchingpool_raw[, c("ALF_PE","WOB", "DEATH_DT","SEX", "AGE_STUDYSTART")]
+MatchingPool_baseline <- dataprep(MatchingPool_df)
+
+```
+
+
+# Perform match using exact match
+```{r echo = FALSE, include = FALSE}
+swa_matchedOutput1 <- run_exactmatch(UnpaidCarers_baseline, MatchingPool_baseline)
+swa_matchedOutput2 <- match.data(swa_matchedOutput1)
+```
+
+
+# Create sequence flags
+# In Exact match, cases and controls with similar characteristics are placed in the same subclass. Hence, there can be >1 case and control in each subclass.
+# - create a sequence number of cases (unpaid carers) in each subclass and select the maximum sequence number (i.e total unpaid carers per subclass)
+# - merge this the max sequence number for each subclass back to the case and controls only table
+# - merge extended information
+# - clean the controls dataframe
+# -- add TreatSeq col
+# -- select required cols
+# -- merge extended information (RUC, wimd description, etc)
+```{r echo = FALSE, include = FALSE}
+# create sequence for cases within each subclass
+casesOnly1 <- swa_matchedOutput2 %>% filter(treat == 1) %>% 
+  group_by(subclass) %>% 
+  arrange(subclass, ALF_PE) %>%
+  mutate(treatSeq = row_number()) %>%
+  ungroup()
+
+
+# max for each subclass where treat = 1 (i.e. total number of unpaid carers in each subclass)
+maxSeq <- casesOnly1 %>% group_by(subclass) %>% 
+  filter(treatSeq == max(treatSeq)) %>% ungroup() %>% select(subclass, treatSeq)
+
+names(maxSeq)[2] <- "MaxTreatSeq"
+
+casesOnly2 <- casesOnly1 %>% merge(maxSeq, by = "subclass", all.x =TRUE)
+
+swa_matched_1 <- casesOnly2 %>% 
+  merge(UnpaidCarers_baseline[, c("ALF_PE","SEX", "AGE_STUDYSTART", "LSOA2011_CD","WIMD","WIMD_DESC", "RUC11_DESC" )] , by="ALF_PE", all.x=TRUE)
+
+# select controls only and merge with max treatSeq
+controlsOnly1 <- swa_matchedOutput2 %>% filter(treat == 0)  %>% merge(maxSeq, by = "subclass", all.x =TRUE)
+
+# add treatSeq column to match number of columns in casesOnly
+controlsOnly2 <- controlsOnly1 %>% mutate(treatSeq = NA)
+
+# select needed columns from controlsOnly df
+controlsOnly3 <- controlsOnly2[, names(casesOnly2)]
+
+# join merged data with extended information (RUC, wimd description,)
+swa_matched_0 <- controlsOnly3 %>% 
+  merge(MatchingPool_baseline[, c("ALF_PE","SEX", "AGE_STUDYSTART" )] , by="ALF_PE", all.x=TRUE)
+
+```
+
+
+
+# impute index dates
+# - Prepare unpaid carers dataset
+# -- create a subset of the data with required columns for unpaid carers
+# -- add above to unpaid carers dataset
+# -- add index date 
+# -- calcuate are at index date
+# - run function to get 1-1 match between unpaid carers and non-carers
+# - perform checks (no duplicates, ratio and counts)
+# - add ethnicity data to the 1-1 matched df
+# - select columns in specified order
+```{r echo = FALSE, include = FALSE}
+#create  subsets of data
+s_assmtdt <- sqldf("SELECT m.ALF_PE, m.subclass, m.treatSeq, u.IDENTIFIEDBY, FIRST_IDENTIFIED_DATE, FIRST_ASSESS, LAST_ASSESS, NUMBEROFCARERASSESSMENTCOMPLETED
+      FROM swa_matched_1 m LEFT JOIN 
+      (SELECT ALF_PE, IDENTIFIEDBY, FIRST_IDENTIFIED_DATE, FIRST_ASSESS, LAST_ASSESS, NUMBEROFCARERASSESSMENTCOMPLETED FROM swa_uc_raw) u
+      ON m.ALF_PE = u.ALF_PE
+      WHERE m.treat=1")
+
+
+# rename for consistency
+names(s_assmtdt)[6:ncol(s_assmtdt)] <- c("FIRST_CARER_ASSMT", "LATEST_CARER_ASSMT", "TOTAL_NUM_ASSESSMENTS")
+
+# add index dates back to carers
+swa_matched_1_full <- swa_matched_1 %>% merge(subset(s_assmtdt, select=-c(subclass, treatSeq)), by= "ALF_PE", all.x=TRUE)
+
+# add age at index date for unpaid carers
+swa_matched_1_full <- swa_matched_1_full %>% mutate(AGE_INDEXDATE = floor(time_length( difftime(FIRST_IDENTIFIED_DATE , WOB ), "years" ))) 
+
+# run function to select controls
+newly_matched_df <- extract_right_controls(swa_matched_1_full, swa_matched_0 )
+
+
+#check ratio
+ratio_df <- newly_matched_df %>%
+  select(ALF_PE, treat, IDENTIFIEDBY) %>%  
+  distinct_all() %>% 
+  group_by(treat, IDENTIFIEDBY) %>% 
+  summarise(total = n())
+
+
+
+# Add ethnicity data
+matched_ethnicity <- sqlQuery(sql,paste("SELECT ALF_PE, ETHN_EC_ONS_DATE_LATEST_CODE, ETHN_EC_ONS_DATE_LATEST_DESC FROM SAILW1429V.ETHN_1429 eth WHERE eth.ALF_PE IN (", paste(newly_matched_df$ALF_PE, collapse = ","), ")", sep=""))
+
+
+
+matched_eth_swansea <- newly_matched_df %>%  merge(matched_ethnicity, by="ALF_PE",all.x = TRUE) 
+matched_eth_swansea[21] <- lapply(matched_eth_swansea[21], addNA) # allows NA's to be read as character
+
+matched_eth_swansea <- matched_eth_swansea %>%
+  select(subclass, treatSeq, ALF_PE, treat, SEX, SEX_Desc, WOB, AGE_INDEXDATE, 
+         AGEGROUP_STUDYSTART, AGE_STUDYSTART, LSOA2011_CD, WIMD, WIMD_DESC, RUC11_DESC, 
+         IDENTIFIEDBY, FIRST_IDENTIFIED_DATE, FIRST_CARER_ASSMT, LATEST_CARER_ASSMT, 
+         TOTAL_NUM_ASSESSMENTS, ETHN_EC_ONS_DATE_LATEST_CODE,ETHN_EC_ONS_DATE_LATEST_DESC)
+
+
+
+```
+
+
+
+
+# Export matched data to DB2
+```{r echo = FALSE, include = FALSE}
+
+sqlQuery(sql, "DROP TABLE SAILW1429V.PEJE_MATCHED_COHORT_SWANSEA_2;")
+
+sqlQuery(sql, "CREATE TABLE SAILW1429V.PEJE_MATCHED_COHORT_SWANSEA_2
+(
+SUBCLASS VARCHAR(5)
+, TREATSEQ INTEGER
+, ALF_PE BIGINT
+, TREATED INTEGER
+, SEX INTEGER
+, SEX_DESC VARCHAR(50)
+, WOB DATE
+, AGE_INDEXDATE INTEGER
+, AGEGROUP_INDEXDATE VARCHAR(7)
+, AGE_STUDYSTART INTEGER
+, LSOA2011_CD VARCHAR(15)
+, WIMD INTEGER
+, WIMD_DESC VARCHAR(50)
+, RUC11_DESC VARCHAR(50)
+, FIRST_IDENTIFIED_BY VARCHAR(3)
+, FIRST_IDENTIFIED_DATE DATE
+, FIRST_ASSMT_DATE DATE
+, LATEST_ASSMT_DATE DATE
+, TOTAL_NUM_ASSESSMENTS INTEGER
+, ETHNICITY_CD INTEGER
+, ETHNICITY_DESC VARCHAR(7)
+);")
+
+
+# set fast = T for "missing columns in 'data'" error
+sqlSave(sql, matched_eth_swansea, "SAILW1429V.PEJE_MATCHED_COHORT_SWANSEA_2", rownames = F, append = T , fast = F, verbose = T)
+
+```
